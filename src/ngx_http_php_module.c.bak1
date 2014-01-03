@@ -1,0 +1,329 @@
+
+/*
+ * Copyright (C) Coooold (coooold@gmail.com)
+ */
+
+#include <nginx.h>
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_http.h>
+
+#include <sapi/embed/php_embed.h>
+#include <TSRM.h>
+#include <SAPI.h>
+#include <zend_ini.h>
+#include <php.h>
+
+
+static void* ngx_http_php_loc_conf(ngx_conf_t* cf);
+static ngx_int_t ngx_http_php_handler(ngx_http_request_t* r);
+static char* ngx_http_php(ngx_conf_t* cf, ngx_command_t* cmd, void* conf);
+static int php_module_ub_write(const char *str, unsigned int str_length TSRMLS_DC);
+
+static ngx_int_t ngx_http_php_vm_init(ngx_cycle_t *cycle);
+static void ngx_http_php_vm_quit(ngx_cycle_t *cycle);
+
+static void ***tsrm_ls;
+static ngx_chain_t *out;
+static ngx_chain_t *out_current;
+static ngx_http_request_t* temp_request;
+
+typedef struct{
+	ngx_str_t file_name;
+	zend_file_handle script;
+	//zend_op_array *op_array;
+} ngx_http_php_loc_conf_t;
+
+
+//static zend_op_array* compile_php_vm_string(char *str, int str_len, char *string_name TSRMLS_DC);
+//static zend_op_array* compile_php_vm_file(char *file_name TSRMLS_DC);
+//static int run_php_vm(zend_op_array *new_op_array TSRMLS_DC);
+static void runPHP(ngx_http_php_loc_conf_t* plcf);
+
+
+static ngx_command_t ngx_http_php_commands[] = {
+	{
+	    ngx_string("php"), // The command name
+        NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+        ngx_http_php, // The command handler
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_php_loc_conf_t, file_name),
+        NULL
+	},
+	ngx_null_command
+};
+
+//开始读取配置前初始化，初始化php_embed环境
+static ngx_int_t ngx_http_php_preconfiguration(ngx_conf_t *cf){
+	php_embed_module.ub_write = php_module_ub_write;
+	php_embed_init(0, NULL PTSRMLS_CC);
+	
+	return 0;
+}
+
+// 上下文
+static ngx_http_module_t ngx_http_php_module_ctx = {
+    ngx_http_php_preconfiguration,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    ngx_http_php_loc_conf,
+    NULL
+};
+
+//初始化loc配置
+static void* ngx_http_php_loc_conf(ngx_conf_t* cf) {
+    ngx_http_php_loc_conf_t* conf;
+
+    conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_php_loc_conf_t));
+    if (conf == NULL) {
+        return NGX_CONF_ERROR;
+    }
+    conf->file_name.len = 0;
+    conf->file_name.data = NULL;
+	//conf->op_array = NULL;
+    return conf;
+}
+
+// 模块定义
+ngx_module_t ngx_http_php_module = {
+    NGX_MODULE_V1,
+    &ngx_http_php_module_ctx,
+    ngx_http_php_commands,
+    NGX_HTTP_MODULE,
+	NULL,	// 初始化 master 时执行
+    NULL,	//初始化模块时执行
+    ngx_http_php_vm_init,	// 初始化进程时执行
+    NULL,	// 初始化线程时执行
+    NULL,	// 退出线程时执行
+    ngx_http_php_vm_quit,	// 退出进程时执行
+    NULL,	// 退出 master 时执行
+    NGX_MODULE_V1_PADDING
+};
+
+
+//命令处理器
+static char* ngx_http_php(ngx_conf_t* cf, ngx_command_t* cmd, void* conf){
+    ngx_http_core_loc_conf_t* clcf;
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf->handler = ngx_http_php_handler;
+    ngx_conf_set_str_slot(cf, cmd, conf);
+		
+	ngx_http_php_loc_conf_t* plcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_php_module);
+	//write(STDOUT_FILENO, plcf->file_name.data, plcf->file_name.len);
+	
+	char *file_name = ngx_pcalloc(cf->pool, plcf->file_name.len+1);
+    if (conf == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+	ngx_memcpy(file_name, plcf->file_name.data, plcf->file_name.len);
+	file_name[plcf->file_name.len] = '\0';
+	
+	//plcf->op_array = compile_php_vm_file(file_name TSRMLS_CC);
+
+	plcf->script.type = ZEND_HANDLE_FP;
+    plcf->script.filename = file_name;
+    plcf->script.opened_path = NULL;
+    plcf->script.free_filename = 0;
+
+    if (!(plcf->script.handle.fp = fopen(plcf->script.filename, "rb"))) {
+        fprintf(stderr, "Unable to open: %s\n", file_name);
+        exit(-1);
+	}
+
+    return NGX_CONF_OK;
+}
+
+static ngx_int_t ngx_http_php_vm_init(ngx_cycle_t *cycle){
+	return 0;
+}
+
+static void ngx_http_php_vm_quit(ngx_cycle_t *cycle){
+	php_embed_shutdown(TSRMLS_C);
+	tsrm_ls = NULL;
+}
+
+
+//处理器
+static ngx_int_t ngx_http_php_handler(ngx_http_request_t* r) {
+    ngx_int_t rc;
+
+    ngx_http_php_loc_conf_t* plcf;
+    plcf = ngx_http_get_module_loc_conf(r, ngx_http_php_module);
+
+    //r->headers_out.content_type.len = sizeof("text/plain") - 1;
+    //r->headers_out.content_type.data = (u_char*)"text/plain";
+
+	out = NULL;
+	out_current = NULL;
+	temp_request = r;
+	runPHP(plcf);
+
+	if(out == NULL){
+		return NGX_ERROR;
+	}
+/*
+	//获取内容长度
+	r->headers_out.content_length_n = 0;
+	ngx_chain_t *i = out;
+	while(i != NULL)
+	{
+		r->headers_out.content_length_n += (i->buf->last - i->buf->pos);
+		i = i->next;
+	}
+*/
+    r->headers_out.status = NGX_HTTP_OK;
+    rc = ngx_http_send_header(r);
+	
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    return ngx_http_output_filter(r, out);
+}
+
+/*
+//从字符串加载opcode
+static zend_op_array* compile_php_vm_string(char *str, int str_len, char *string_name TSRMLS_DC){
+	zval pv;
+	zend_op_array *new_op_array;
+	
+	zend_uint original_compiler_options;
+	
+	pv.value.str.len = strlen(str);
+	pv.value.str.val = estrndup(str, pv.value.str.len);
+
+	pv.type = IS_STRING;
+	
+	original_compiler_options = CG(compiler_options);
+	CG(compiler_options) = ZEND_COMPILE_DEFAULT_FOR_EVAL;
+	new_op_array = zend_compile_string(&pv, string_name TSRMLS_CC);
+	CG(compiler_options) = original_compiler_options;
+	
+	return new_op_array;
+}
+*/
+
+/*
+//从文件加载opcode
+static zend_op_array* compile_php_vm_file(char *file_name TSRMLS_DC){
+	zend_op_array *new_op_array;
+	zend_uint original_compiler_options;
+
+	zend_file_handle script;
+
+	script.type = ZEND_HANDLE_FP;
+    script.filename = file_name;
+    script.opened_path = NULL;
+    script.free_filename = 0;
+
+    if (!(script.handle.fp = fopen(script.filename, "rb"))) {
+        fprintf(stderr, "Unable to open: %s\n", file_name);
+        exit(-1);
+	}
+
+	original_compiler_options = CG(compiler_options);
+	CG(compiler_options) = ZEND_COMPILE_DEFAULT_FOR_EVAL;
+	new_op_array = zend_compile_file(&script, ZEND_INCLUDE TSRMLS_CC);
+	CG(compiler_options) = original_compiler_options;
+	
+	//fclose(script.handle.fp);
+	
+	return new_op_array;
+}
+
+
+static int run_php_vm(zend_op_array *new_op_array TSRMLS_DC){
+	
+	zend_op_array *original_active_op_array = EG(active_op_array);
+	int retval;
+	
+	zval* retval_ptr = NULL;
+	
+	if (new_op_array) {
+		zval *local_retval_ptr=NULL;
+		zval **original_return_value_ptr_ptr = EG(return_value_ptr_ptr);
+		zend_op **original_opline_ptr = EG(opline_ptr);
+		int orig_interactive = CG(interactive);
+		
+		EG(return_value_ptr_ptr) = &local_retval_ptr;
+		EG(active_op_array) = new_op_array;
+		EG(no_extensions)=1;
+		if (!EG(active_symbol_table)) {
+			zend_rebuild_symbol_table(TSRMLS_C);
+		}
+		CG(interactive) = 0;
+		
+		zend_try {
+			zend_execute(new_op_array TSRMLS_CC);
+			} zend_catch {
+			zend_bailout();
+		} zend_end_try();
+		
+		CG(interactive) = orig_interactive;
+		if (local_retval_ptr) {
+			if (retval_ptr) {
+				COPY_PZVAL_TO_ZVAL(*retval_ptr, local_retval_ptr);
+				} else {
+				zval_ptr_dtor(&local_retval_ptr);
+			}
+			} else {
+			if (retval_ptr) {
+				INIT_ZVAL(*retval_ptr);
+			}
+		}
+		
+		EG(no_extensions)=0;
+		EG(opline_ptr) = original_opline_ptr;
+		EG(active_op_array) = original_active_op_array;
+		
+		EG(return_value_ptr_ptr) = original_return_value_ptr_ptr;
+		retval = SUCCESS;
+		} else {
+		retval = FAILURE;
+	}
+
+	return retval;
+}
+*/
+static int php_module_ub_write(const char *str, unsigned int str_length TSRMLS_DC)
+{
+    ngx_chain_t *next_out;
+	ngx_buf_t* b;
+	next_out = (ngx_chain_t*)ngx_pcalloc(temp_request->pool, sizeof(ngx_chain_t));
+	b = (ngx_buf_t*)ngx_pcalloc(temp_request->pool, sizeof(ngx_buf_t));
+	b->pos = ngx_pcalloc(temp_request->pool, str_length);
+	ngx_memcpy(b->pos, str, str_length);
+	b->last = b->pos + str_length;
+	b->memory = 1;
+	b->last_buf = 1;
+	next_out->buf = b;
+    next_out->next = NULL;
+	
+	if(out == NULL)
+	{
+		out = next_out;
+		out_current = out;
+	}else{
+		out_current->next = next_out;
+		out_current = next_out;
+	}
+	
+    return str_length;
+}
+
+
+
+
+	
+static void runPHP(ngx_http_php_loc_conf_t* plcf){
+	zend_first_try {
+			//run_php_vm(plcf->op_array TSRMLS_CC);
+			php_execute_script(&(plcf->script) TSRMLS_CC);
+	} zend_catch {
+	} zend_end_try();
+
+}
